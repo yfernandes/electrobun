@@ -1,0 +1,81 @@
+
+From 74ffc15ef0f9abd9f429f71d742731f8130edfcb Mon Sep 17 00:00:00 2001
+From: Mase Graye <mase@mg.dev>
+Date: Wed, 11 Mar 2026 15:08:31 -0500
+Subject: [PATCH] Fix CEF render buffer mismatch on tiling window managers
+ (Hyprland)
+
+The OnAfterCreated interval timer now polls the parent X11 window's
+actual size and syncs the CEF child window when the parent has been
+resized by the WM. This catches the tiling resize that happens between
+window creation and first render, which previously caused the CEF
+content to render at the initial requested size rather than the
+tiled size.
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ package/src/native/linux/nativeWrapper.cpp | 33 +++++++++++++++++++---
+ 1 file changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/package/src/native/linux/nativeWrapper.cpp b/package/src/native/linux/nativeWrapper.cpp
+index d8eb5bc21..c9e99ae1b 100644
+--- a/package/src/native/linux/nativeWrapper.cpp
++++ b/package/src/native/linux/nativeWrapper.cpp
+@@ -1256,11 +1256,17 @@ class ElectrobunClient : public CefClient,
+             CefRefPtr<CefBrowser> browser;
+             gint64 start_time;
+             int trigger_count;
++            Window parent_window;
++            int last_parent_width;
++            int last_parent_height;
+         };
+-        
++
+         auto* interval_data = new LayoutIntervalData{
+-            browser, 
++            browser,
+             g_get_monotonic_time(), // microseconds since arbitrary point
++            0,
++            parent_window_handle_,
++            0,
+             0
+         };
+         
+@@ -1280,8 +1286,27 @@ class ElectrobunClient : public CefClient,
+                 if (cefWindow && cefWindow != 0x1) {
+                     
+                     
+-                    // Get window dimensions for mouse event coordinates
+                     Display* display = gdk_x11_get_default_xdisplay();
++
++                    // Check if parent window was resized by WM (e.g. tiling WM)
++                    // and sync CEF browser window to match
++                    if (lid->parent_window) {
++                        XWindowAttributes parent_attrs;
++                        if (XGetWindowAttributes(display, lid->parent_window, &parent_attrs) != 0) {
++                            if (parent_attrs.width != lid->last_parent_width ||
++                                parent_attrs.height != lid->last_parent_height) {
++                                lid->last_parent_width = parent_attrs.width;
++                                lid->last_parent_height = parent_attrs.height;
++                                // Resize CEF window to match parent
++                                XMoveResizeWindow(display, (Window)cefWindow,
++                                    0, 0, parent_attrs.width, parent_attrs.height);
++                                XFlush(display);
++                                lid->browser->GetHost()->WasResized();
++                            }
++                        }
++                    }
++
++                    // Get window dimensions for mouse event coordinates
+                     XWindowAttributes attrs;
+                     if (XGetWindowAttributes(display, (Window)cefWindow, &attrs) != 0) {
+                         // Send mouse move event to trigger layout recalculation
+@@ -1289,7 +1314,7 @@ class ElectrobunClient : public CefClient,
+                         moveEvent.x = attrs.width / 2;
+                         moveEvent.y = attrs.height / 2;
+                         lid->browser->GetHost()->SendMouseMoveEvent(moveEvent, false);
+-                        
++
+                         // Send minimal scroll event
+                         CefMouseEvent scrollEvent;
+                         scrollEvent.x = attrs.width / 2;
